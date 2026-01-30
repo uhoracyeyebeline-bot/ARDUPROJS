@@ -1,453 +1,349 @@
-
-
 #include <Arduino.h>
+#include <SoftwareSerial.h> // For Bluetooth HC-05/HC-06
 
-// =======================================================
-// PINS
-// =======================================================
+// ================== PINOUT ==================
+#define X_STEP_PIN 2
+#define X_DIR_PIN 3
+#define X_ENABLE_PIN 4
 
-// X axis
-const uint8_t X_STEP_PIN   = 2;
-const uint8_t X_DIR_PIN    = 3;
-const uint8_t X_ENABLE_PIN = 4;
+#define Y_STEP_PIN 5
+#define Y_DIR_PIN 6
+#define Y_ENABLE_PIN 7
 
-// Y axis
-const uint8_t Y_STEP_PIN   = 5;
-const uint8_t Y_DIR_PIN    = 6;
-const uint8_t Y_ENABLE_PIN = 7;
+#define Z_STEP_PIN 8
+#define Z_DIR_PIN 9
+#define Z_ENABLE_PIN 10
 
-// Z axis
-const uint8_t Z_STEP_PIN   = 8;
-const uint8_t Z_DIR_PIN    = 9;
-const uint8_t Z_ENABLE_PIN = 10;
+#define BUZZER_PIN 13 // Buzzer moved to digital pin 13
 
-// Joystick 1 (X & Y movement)
-const uint8_t JOY1_X  = A0;   // Left / Right  → X
-const uint8_t JOY1_Y  = A1;   // Forward / Back → Y
-const uint8_t JOY1_SW = 11;   // STOP
+#define JOYSTICK1_VRx A0 // Left Joystick X-axis
+#define JOYSTICK1_VRy A1 // Left Joystick Y-axis
+#define JOYSTICK1_SW 11  // Left Joystick button (moved to pin 11)
 
-// Joystick 2 (Z movement)
-const uint8_t JOY2_Y  = A3;   // Up / Down → Z
-const uint8_t JOY2_SW = 12;   // AUTO
+#define JOYSTICK2_VRy A3 // Right Joystick Y-axis
+#define JOYSTICK2_SW 12  // Right Joystick button (moved to pin 12)
 
-// =======================================================
-// MOTION SETTINGS
-// =======================================================
+// Bluetooth on A4 (TX) and A5 (RX) via SoftwareSerial
+#define BT_TX_PIN A4 // Arduino TX -> HC-05 RX (use voltage divider to 3.3V)
+#define BT_RX_PIN A5 // Arduino RX <- HC-05 TX
 
-const unsigned long STEP_PULSE_US = 4;
-const unsigned long START_DELAY_US = 2000;
-const unsigned long FAST_DELAY_US  = 400;
+// ================== MOTION SETTINGS ==================
+#define STEP_PULSE_US 5        // Step pin high pulse width
+#define STEP_DELAY_US 700      // Fixed delay between steps for non-ramped moves
+#define MIN_STEP_DELAY_US 200  // Ramping minimum delay (faster)
+#define MAX_STEP_DELAY_US 1500 // Ramping maximum delay (slower)
+#define JOG_STEPS 50           // Baseline steps per jog command
+#define GEAR_RATIO 4.875       // Gear ratio multiplier
 
-const int JOY_CENTER  = 512;
-const int JOY_DEADZONE = 60;
+// Joystick tuning
+#define CENTER_POSITION 512    // Joystick center analog value
+#define JOYSTICK_THRESHOLD 50  // Deadzone threshold
+#define JOY_FILTER_ALPHA 0.2f  // Low-pass filter alpha (0..1) for smoothing
+#define JOY_MIN_RAW_STEPS 8    // Minimum raw steps per cycle from joystick deflection
+#define JOY_MAX_RAW_STEPS 26   // Maximum raw steps per cycle from joystick deflection
 
-const long JOG_RAW_STEPS = 5;
+// Timing control to avoid repeated large bursts
+#define JOYSTICK_REPEAT_MS 50  // Minimum interval between joystick-triggered moves
 
-// Gear ratio = 39 / 8 = 4.875
-static long convertSteps(long steps) {
-  return (steps * 39 + 4) / 8;
+// Buzzer
+#define BUZZER_FREQUENCY 3000  // Buzzer frequency in Hz
+
+// ================== AXIS STRUCT ==================
+struct Axis {
+  uint8_t stepPin;
+  uint8_t dirPin;
+  uint8_t enPin;
+};
+
+// ================== AXES ==================
+Axis X = {X_STEP_PIN, X_DIR_PIN, X_ENABLE_PIN};
+Axis Y = {Y_STEP_PIN, Y_DIR_PIN, Y_ENABLE_PIN};
+Axis Z = {Z_STEP_PIN, Z_DIR_PIN, Z_ENABLE_PIN};
+
+// ================== STATES ==================
+enum Mode { MANUAL, AUTO };
+Mode currentMode = MANUAL; // Start in MANUAL mode
+
+// ================== BLUETOOTH ==================
+SoftwareSerial Bluetooth(BT_RX_PIN, BT_TX_PIN); // RX, TX
+
+// ================== FILTERED JOYSTICK VALUES ==================
+float joy1X_filtered = CENTER_POSITION;
+float joy1Y_filtered = CENTER_POSITION;
+float joy2Y_filtered = CENTER_POSITION;
+
+unsigned long lastJoy1MoveMs = 0;
+unsigned long lastJoy2MoveMs = 0;
+
+// ================== UTILITIES ==================
+long convertSteps(long rawSteps) {
+  // Convert raw steps by gear ratio to actual driver steps
+  return (long)(rawSteps * GEAR_RATIO);
 }
 
-// =======================================================
-// MODE
-// =======================================================
+// Clamp helper
+template <typename T>
+T clamp(T v, T lo, T hi) { return (v < lo) ? lo : (v > hi) ? hi : v; }
 
-enum Mode { MANUAL, AUTO };
-static Mode currentMode = MANUAL;
+// Map joystick deflection to a small step count (smooth, non-violent)
+long stepsFromDeflection(int deflection) {
+  // deflection is abs(analog - CENTER) - threshold
+  deflection = clamp(deflection, 0, 512 - JOYSTICK_THRESHOLD);
+  // Scale to [JOY_MIN_RAW_STEPS .. JOY_MAX_RAW_STEPS]
+  long raw = JOY_MIN_RAW_STEPS +
+             (long)((JOY_MAX_RAW_STEPS - JOY_MIN_RAW_STEPS) *
+                    ((float)deflection / (float)(512 - JOYSTICK_THRESHOLD)));
+  return raw;
+}
 
-// =======================================================
-// AXIS CLASS
-// =======================================================
+// ================== PROTOTYPES ==================
+void startBuzzer();
+void stopBuzzer();
+void moveAxis(Axis a, bool dir, long steps);
+void rampMove(Axis a, bool dir, long steps);
+void moveYPlusAndZPlus(long steps);
+void stopAll();
+void toggleAutoMode();
+void handleJoystickControls();
+void handleBluetoothControls();
+void handleContinuousManual();
+void autoModeSequence();
 
-class Axis {
-public:
-  Axis(uint8_t s, uint8_t d, uint8_t e)
-    : stepPin(s), dirPin(d), enPin(e) {}
+// ================== BUZZER ==================
+void startBuzzer() { tone(BUZZER_PIN, BUZZER_FREQUENCY); }
+void stopBuzzer()  { noTone(BUZZER_PIN); }
 
-  void begin() {
-    pinMode(stepPin, OUTPUT);
-    pinMode(dirPin, OUTPUT);
-    pinMode(enPin, OUTPUT);
-    digitalWrite(stepPin, LOW);
-    digitalWrite(dirPin, LOW);
-    disable();
+// ================== MOVES ==================
+void moveAxis(Axis a, bool dir, long steps) {
+  digitalWrite(a.enPin, LOW);
+  digitalWrite(a.dirPin, dir ? HIGH : LOW);
+
+  startBuzzer();
+  for (long i = 0; i < steps; i++) {
+    digitalWrite(a.stepPin, HIGH);
+    delayMicroseconds(STEP_PULSE_US);
+    digitalWrite(a.stepPin, LOW);
+    delayMicroseconds(STEP_DELAY_US);
   }
+  stopBuzzer();
+}
 
-  void enable()  { digitalWrite(enPin, LOW); }
-  void disable() { digitalWrite(enPin, HIGH); }
+void rampMove(Axis a, bool dir, long steps) {
+  uint16_t delayDuration = MAX_STEP_DELAY_US;
+  uint16_t decrement = (MAX_STEP_DELAY_US - MIN_STEP_DELAY_US) / (steps > 0 ? steps : 1);
 
-  void move(bool dir, long steps, unsigned long delayUs) {
-    if (steps <= 0) return;
+  digitalWrite(a.enPin, LOW);
+  digitalWrite(a.dirPin, dir ? HIGH : LOW);
 
-    enable();
-    digitalWrite(dirPin, dir ? HIGH : LOW);
+  startBuzzer();
+  for (long i = 0; i < steps; i++) {
+    digitalWrite(a.stepPin, HIGH);
+    delayMicroseconds(delayDuration);
+    digitalWrite(a.stepPin, LOW);
+    delayMicroseconds(delayDuration);
 
-    for (long i = 0; i < steps; i++) {
-      digitalWrite(stepPin, HIGH);
-      delayMicroseconds(STEP_PULSE_US);
-      digitalWrite(stepPin, LOW);
-      delayMicroseconds(delayUs);
+    if (delayDuration > MIN_STEP_DELAY_US) {
+      delayDuration -= decrement;
+      if (delayDuration < MIN_STEP_DELAY_US) delayDuration = MIN_STEP_DELAY_US;
+    }
+  }
+  stopBuzzer();
+}
+
+void moveYPlusAndZPlus(long steps) {
+  // Simultaneous fixed stepping with small steps per cycle to avoid violent motion
+  digitalWrite(Y.enPin, LOW);
+  digitalWrite(Z.enPin, LOW);
+  digitalWrite(Y.dirPin, HIGH); // Y+
+  digitalWrite(Z.dirPin, HIGH); // Z+
+
+  startBuzzer();
+  for (long i = 0; i < steps; i++) {
+    digitalWrite(Y.stepPin, HIGH);
+    digitalWrite(Z.stepPin, HIGH);
+    delayMicroseconds(STEP_PULSE_US);
+    digitalWrite(Y.stepPin, LOW);
+    digitalWrite(Z.stepPin, LOW);
+    delayMicroseconds(STEP_DELAY_US);
+  }
+  stopBuzzer();
+}
+
+// ================== CONTROL HELPERS ==================
+void stopAll() {
+  digitalWrite(X_ENABLE_PIN, HIGH);
+  digitalWrite(Y_ENABLE_PIN, HIGH);
+  digitalWrite(Z_ENABLE_PIN, HIGH);
+  stopBuzzer();
+  Serial.println("STOPPED: All motors disabled.");
+  Bluetooth.println("STOPPED: All motors disabled.");
+}
+
+void toggleAutoMode() {
+  currentMode = (currentMode == MANUAL) ? AUTO : MANUAL;
+  const char* msg = (currentMode == MANUAL) ? "Switched to MANUAL mode" : "Switched to AUTO mode";
+  Serial.println(msg);
+  Bluetooth.println(msg);
+}
+
+// ================== INPUT HANDLERS ==================
+void handleJoystickControls() {
+  // Low-pass filter the analog inputs for smooth command generation
+  int joy1X_raw = analogRead(JOYSTICK1_VRx);
+  int joy1Y_raw = analogRead(JOYSTICK1_VRy);
+  int joy2Y_raw = analogRead(JOYSTICK2_VRy);
+
+  joy1X_filtered = joy1X_filtered + JOY_FILTER_ALPHA * (joy1X_raw - joy1X_filtered);
+  joy1Y_filtered = joy1Y_filtered + JOY_FILTER_ALPHA * (joy1Y_raw - joy1Y_filtered);
+  joy2Y_filtered = joy2Y_filtered + JOY_FILTER_ALPHA * (joy2Y_raw - joy2Y_filtered);
+
+  bool joystick1Active = (digitalRead(JOYSTICK1_SW) == LOW); // Left joystick button
+  bool joystick2Active = (digitalRead(JOYSTICK2_SW) == LOW); // Right joystick button
+
+  unsigned long now = millis();
+
+  // Joystick 1 controls X and Z (requires button pressed to be active)
+  if (joystick1Active && (now - lastJoy1MoveMs) >= JOYSTICK_REPEAT_MS) {
+    int xDef = (int)fabs(joy1X_filtered - CENTER_POSITION) - JOYSTICK_THRESHOLD;
+    int zDef = (int)fabs(joy1Y_filtered - CENTER_POSITION) - JOYSTICK_THRESHOLD;
+
+    if (xDef > 0) {
+      bool dirX = (joy1X_filtered > CENTER_POSITION);
+      long rawSteps = stepsFromDeflection(xDef);
+      long steps = convertSteps(rawSteps);
+      // Use ramp for smoother start
+      rampMove(X, dirX, steps);
+      lastJoy1MoveMs = now;
+    } else if (zDef > 0) {
+      bool dirZ = (joy1Y_filtered > CENTER_POSITION);
+      long rawSteps = stepsFromDeflection(zDef);
+      long steps = convertSteps(rawSteps);
+      rampMove(Z, dirZ, steps);
+      lastJoy1MoveMs = now;
     }
   }
 
-private:
-  uint8_t stepPin, dirPin, enPin;
-};
+  // Joystick 2 controls Y and the combo Y+&Z+ (requires button pressed)
+  if (joystick2Active && (now - lastJoy2MoveMs) >= JOYSTICK_REPEAT_MS) {
+    int yDef = (int)fabs(joy2Y_filtered - CENTER_POSITION) - JOYSTICK_THRESHOLD;
 
-// =======================================================
-// AXIS OBJECTS
-// =======================================================
+    if (yDef > 0) {
+      bool up = (joy2Y_filtered > CENTER_POSITION);
+      long rawSteps = stepsFromDeflection(yDef);
+      long steps = convertSteps(rawSteps);
 
-Axis X(X_STEP_PIN, X_DIR_PIN, X_ENABLE_PIN);
-Axis Y(Y_STEP_PIN, Y_DIR_PIN, Y_ENABLE_PIN);
-Axis Z(Z_STEP_PIN, Z_DIR_PIN, Z_ENABLE_PIN);
-
-// =======================================================
-// HELPERS
-// =======================================================
-
-static void stopAll() {
-  Serial.println("STOPPED (holding position)");
-}
-
-static unsigned long joystickSpeed(int value) {
-  return map(abs(value - JOY_CENTER),
-             JOY_DEADZONE, 512,
-             START_DELAY_US, FAST_DELAY_US);
-}
-
-// =======================================================
-// JOYSTICK CONTROL
-// =======================================================
-
-static void handleJoystick() {
-  int joyX = analogRead(JOY1_X);
-  int joyY = analogRead(JOY1_Y);
-  int joyZ = analogRead(JOY2_Y);
-
-  // ---------- X AXIS ----------
-  if (abs(joyX - JOY_CENTER) > JOY_DEADZONE) {
-    bool dir = joyX > JOY_CENTER;
-    X.move(dir, convertSteps(JOG_RAW_STEPS),
-           joystickSpeed(joyX));
-  }
-
-  // ---------- Y AXIS ----------
-  if (abs(joyY - JOY_CENTER) > JOY_DEADZONE) {
-    bool dir = joyY > JOY_CENTER;
-    Y.move(dir, convertSteps(JOG_RAW_STEPS),
-           joystickSpeed(joyY));
-  }
-
-  // ---------- Z AXIS ----------
-  if (abs(joyZ - JOY_CENTER) > JOY_DEADZONE) {
-    bool dir = joyZ > JOY_CENTER;
-    Z.move(dir, convertSteps(JOG_RAW_STEPS),
-           joystickSpeed(joyZ));
-  }
-
-  // ---------- BUTTONS ----------
-  if (digitalRead(JOY1_SW) == LOW) {
-    stopAll();
-  }
-
-  if (digitalRead(JOY2_SW) == LOW) {
-    currentMode = AUTO;
+      // Smooth behavior: small steps each cycle; avoid violent long bursts
+      if (up) {
+        // Combined smooth movement upward: Y+ and Z+ with small steps
+        moveYPlusAndZPlus(steps);
+      } else {
+        // Backward on Y only (Y-)
+        rampMove(Y, false, steps);
+      }
+      lastJoy2MoveMs = now;
+    }
   }
 }
 
-// =======================================================
-// AUTO SEQUENCE
-// =======================================================
-
-static void autoSequence() {
-  Serial.println("AUTO MODE START");
-
-  Z.move(true,  convertSteps(400), 800);
-  delay(500);
-
-  X.move(true,  convertSteps(800), 800);
-  delay(500);
-
-  Y.move(true,  convertSteps(600), 800);
-  delay(500);
-
-  X.move(false, convertSteps(800), 800);
-  delay(500);
-
-  Y.move(false, convertSteps(600), 800);
-  delay(500);
-
-  Z.move(false, convertSteps(400), 800);
-  delay(500);
-
-  Serial.println("AUTO MODE END");
+void handleBluetoothControls() {
+  if (Bluetooth.available()) {
+    char c = toupper(Bluetooth.read());
+    switch (c) {
+      case 'W': moveAxis(Z, true, convertSteps(JOG_STEPS));  break; // Z+
+      case 'S': moveAxis(Z, false, convertSteps(JOG_STEPS)); break; // Z-
+      case 'A': moveAxis(X, false, convertSteps(JOG_STEPS)); break; // X-
+      case 'D': moveAxis(X, true, convertSteps(JOG_STEPS));  break; // X+
+      case 'Q': moveYPlusAndZPlus(convertSteps(JOG_STEPS));  break; // Y+ & Z+ (small bursts)
+      case 'E': moveAxis(Y, false, convertSteps(JOG_STEPS)); break; // Y-
+      case 'G': toggleAutoMode(); break;
+      default: Bluetooth.println("Invalid Command"); break;
+    }
+  }
 }
 
-// =======================================================
-// SETUP & LOOP
-// =======================================================
+void handleContinuousManual() {
+  if (Serial.available()) {
+    char c = toupper(Serial.read());
+    switch (c) {
+      case 'W': moveAxis(Z, true, convertSteps(JOG_STEPS));  break; // Z+
+      case 'S': moveAxis(Z, false, convertSteps(JOG_STEPS)); break; // Z-
+      case 'A': moveAxis(X, false, convertSteps(JOG_STEPS)); break; // X-
+      case 'D': moveAxis(X, true, convertSteps(JOG_STEPS));  break; // X+
+      case 'Q': moveYPlusAndZPlus(convertSteps(JOG_STEPS));  break; // Y+ & Z+
+      case 'E': moveAxis(Y, false, convertSteps(JOG_STEPS)); break; // Y-
+      case 'G': toggleAutoMode(); break;
+      // Optional demo: ramped Z+ for testing smoothness
+      case 'R': rampMove(Z, true, convertSteps(JOG_STEPS));  break;
+      default: break;
+    }
+  }
+  handleJoystickControls();
+}
 
+// ================== AUTO MODE ==================
+void autoModeSequence() {
+  Serial.println("Auto Mode Starting...");
+  Bluetooth.println("Auto Mode Starting...");
+
+  for (int i = 0; i < 5; i++) {
+    rampMove(Y, true, convertSteps(40)); // Y+ smooth
+    delay(300);
+    rampMove(Z, true, convertSteps(40)); // Z+ smooth
+    delay(300);
+  }
+
+  Serial.println("Auto Mode Finished");
+  Bluetooth.println("Auto Mode Finished");
+}
+
+// ================== SETUP ==================
 void setup() {
   Serial.begin(115200);
+  Bluetooth.begin(9600);
 
-  X.begin();
-  Y.begin();
-  Z.begin();
+  pinMode(X_STEP_PIN, OUTPUT);
+  pinMode(X_DIR_PIN, OUTPUT);
+  pinMode(X_ENABLE_PIN, OUTPUT);
 
-  pinMode(JOY1_SW, INPUT_PULLUP);
-  pinMode(JOY2_SW, INPUT_PULLUP);
+  pinMode(Y_STEP_PIN, OUTPUT);
+  pinMode(Y_DIR_PIN, OUTPUT);
+  pinMode(Y_ENABLE_PIN, OUTPUT);
 
-  Serial.println("Robot Arm Ready");
-  Serial.println("Joystick 1: X/Y movement");
-  Serial.println("Joystick 2: Z movement");
+  pinMode(Z_STEP_PIN, OUTPUT);
+  pinMode(Z_DIR_PIN, OUTPUT);
+  pinMode(Z_ENABLE_PIN, OUTPUT);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  pinMode(JOYSTICK1_SW, INPUT_PULLUP); // pin 11
+  pinMode(JOYSTICK2_SW, INPUT_PULLUP); // pin 12
+
+  // Enable drivers
+  digitalWrite(X_ENABLE_PIN, LOW);
+  digitalWrite(Y_ENABLE_PIN, LOW);
+  digitalWrite(Z_ENABLE_PIN, LOW);
+
+  // Initialize filtered values
+  joy1X_filtered = CENTER_POSITION;
+  joy1Y_filtered = CENTER_POSITION;
+  joy2Y_filtered = CENTER_POSITION;
+
+  Serial.println("Robot Arm Initialized: Keyboard, Joysticks, Bluetooth Ready.");
+  Bluetooth.println("Bluetooth Ready. Send W/A/S/D/Q/E or G.");
 }
 
+// ================== LOOP ==================
 void loop() {
+  handleBluetoothControls();
+
+  if (Serial.available()) {
+    char c = toupper(Serial.read());
+    if (c == 'G') toggleAutoMode();
+  }
+
   if (currentMode == MANUAL) {
-    handleJoystick();
+    handleContinuousManual();
   } else {
-    autoSequence();
-    currentMode = MANUAL;
+    autoModeSequence();
   }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// #include <Arduino.h>
-
-
-
-// // Improved, idiomatic C++ rewrite of the original Arduino sketch.
-// // - Better structure using a small Axis class
-// // - Safer Serial input handling
-// // - Clear initialization of enable pins
-// // - Same external behavior: manual jog commands + auto sequence
-
-// // ================== PINS ==================
-// const uint8_t X_STEP_PIN = 2;
-// const uint8_t X_DIR_PIN  = 3;
-// const uint8_t X_ENABLE_PIN = 4;
-
-// const uint8_t Y_STEP_PIN = 5;
-// const uint8_t Y_DIR_PIN  = 6;
-// const uint8_t Y_ENABLE_PIN = 7;
-
-// const uint8_t Z_STEP_PIN = 8;
-// const uint8_t Z_DIR_PIN  = 9;
-// const uint8_t Z_ENABLE_PIN = 10;
-
-// const uint8_t LED_PIN = 13;
-
-// // ================== MOTION SETTINGS ==================
-// const unsigned long STEP_PULSE_US = 4UL;            // STEP high time (us)
-// const unsigned long START_STEP_DELAY_US = 2000UL;  // initial period between steps (us)
-// const unsigned long TARGET_STEP_DELAY_US = 400UL;  // final (fast) period (us)
-// const long JOG_STEPS = 20;                        // base jog steps
-// const double GEAR_RATIO = 4.875;                  // gear ratio (39:8)
-
-// // ================== MODE ==================
-// // Use plain enum for compatibility with older toolchains
-// enum Mode { MANUAL, AUTO };
-// static Mode currentMode = MANUAL;
-
-// // ================== UTILS ==================
-// static long convertSteps(long rawSteps) {
-//   // Use integer math to avoid floating on AVR: GEAR_RATIO = 39/8 = 4.875
-//   // round to nearest: (rawSteps * 39 + 4) / 8
-//   return (rawSteps * 39 + 4) / 8;
-// }
-
-// // ================== Axis class ==================
-// class Axis {
-// public:
-//   Axis(uint8_t step, uint8_t dir, uint8_t en) : stepPin(step), dirPin(dir), enPin(en) {}
-
-//   void begin() {
-//     pinMode(stepPin, OUTPUT);
-//     pinMode(dirPin, OUTPUT);
-//     pinMode(enPin, OUTPUT);
-//     digitalWrite(stepPin, LOW);
-//     digitalWrite(dirPin, LOW);
-//     // leave enabled pin controlled by caller
-//   }
-
-//   void enable() { digitalWrite(enPin, LOW); }
-//   void disable() { digitalWrite(enPin, HIGH); }
-
-//   // Blocking move with simple linear acceleration (ramp) between startPeriod -> endPeriod
-//   void move(bool direction, long steps,
-//             unsigned long startPeriod = START_STEP_DELAY_US,
-//             unsigned long endPeriod = TARGET_STEP_DELAY_US,
-//             unsigned long pulseUs = STEP_PULSE_US) {
-//     if (steps <= 0) return;
-
-//     enable();
-//     digitalWrite(dirPin, direction ? HIGH : LOW);
-
-//     for (long i = 0; i < steps; ++i) {
-//       // progress [0..1]
-//       float progress = (steps > 1) ? (static_cast<float>(i) / static_cast<float>(steps - 1)) : 1.0f;
-//       float periodF = (1.0f - progress) * static_cast<float>(startPeriod) + progress * static_cast<float>(endPeriod);
-//       unsigned long period = static_cast<unsigned long>(periodF + 0.5f);
-
-//       if (period <= pulseUs) period = pulseUs + 1;
-
-//       digitalWrite(stepPin, HIGH);
-//       delayMicroseconds(pulseUs);
-//       digitalWrite(stepPin, LOW);
-//       delayMicroseconds(period - pulseUs);
-//     }
-//   }
-
-// private:
-//   const uint8_t stepPin;
-//   const uint8_t dirPin;
-//   const uint8_t enPin;
-// };
-
-// // ================== Axis instances ==================
-// static Axis X(X_STEP_PIN, X_DIR_PIN, X_ENABLE_PIN);
-// static Axis Y(Y_STEP_PIN, Y_DIR_PIN, Y_ENABLE_PIN);
-// static Axis Z(Z_STEP_PIN, Z_DIR_PIN, Z_ENABLE_PIN);
-
-// // ================== High-level helpers ==================
-// static void enableMotors() {
-//   X.enable();
-//   Y.enable();
-//   Z.enable();
-//   Serial.println("Motors enabled");
-// }
-
-// static void disableMotors() {
-//   X.disable();
-//   Y.disable();
-//   Z.disable();
-//   Serial.println("Motors disabled");
-// }
-
-// static void stopAll() {
-//   // For stepper drivers, keep the motors enabled to hold position unless user requests otherwise.
-//   Serial.println("Motors stopping (holding position)");
-// }
-
-// // ================== Auto sequence ==================
-// static void autoModeSequence() {
-//   Serial.println("Starting AUTO mode...");
-//   enableMotors();
-
-//   Z.move(true,  convertSteps(400));
-//   delay(500);
-
-//   X.move(true,  convertSteps(800));
-//   delay(500);
-
-//   Y.move(true,  convertSteps(600));
-//   delay(500);
-
-//   X.move(false, convertSteps(800));
-//   delay(500);
-
-//   Y.move(false, convertSteps(600));
-//   delay(500);
-
-//   Z.move(false, convertSteps(400));
-//   delay(500);
-
-//   Serial.println("AUTO mode complete");
-// }
-
-// // ================== Manual command handling ==================
-// static void handleManual() {
-//   if (!Serial.available()) return;
-
-//   int inByte = Serial.read();
-//   if (inByte < 0) return;
-//   char cmd = static_cast<char>(toupper(static_cast<unsigned char>(inByte)));
-
-//   switch (cmd) {
-//     case 'W': // +Z
-//       Z.move(true, convertSteps(JOG_STEPS));
-//       Serial.println("OK Z+");
-//       break;
-//     case 'S': // -Z
-//       Z.move(false, convertSteps(JOG_STEPS));
-//       Serial.println("OK Z-");
-//       break;
-//     case 'A': // -X
-//       X.move(false, convertSteps(JOG_STEPS));
-//       Serial.println("OK X-");
-//       break;
-//     case 'D': // +X
-//       X.move(true, convertSteps(JOG_STEPS));
-//       Serial.println("OK X+");
-//       break;
-//     case 'Q': // +Y
-//       Y.move(true, convertSteps(JOG_STEPS));
-//       Serial.println("OK Y+");
-//       break;
-//     case 'E': // -Y
-//       Y.move(false, convertSteps(JOG_STEPS));
-//       Serial.println("OK Y-");
-//       break;
-//     case 'X': // STOP/HOLD
-//       stopAll();
-//       Serial.println("STOPPED");
-//       break;
-//     case 'G': // AUTO
-//       currentMode = Mode::AUTO;
-//       Serial.println("Switching to AUTO mode...");
-//       break;
-//     default:
-//       Serial.println("Unknown command");
-//       break;
-//   }
-// }
-
-// // ================== Arduino setup/loop ==================
-// void setup() {
-//   Serial.begin(115200);
-
-//   // Initialize axis pins
-//   X.begin();
-//   Y.begin();
-//   Z.begin();
-
-//   pinMode(LED_PIN, OUTPUT);
-
-//   // Make enable pins inactive first to avoid accidental drive during startup
-//   X.disable();
-//   Y.disable();
-//   Z.disable();
-
-//   // Then enable (explicit)
-//   enableMotors();
-
-//   Serial.println("Robot Arm Control Initialized!");
-//   Serial.println("Commands: W/S (Z), A/D (X), Q/E (Y), X (Stop), G (Auto Mode)");
-// }
-
-// void loop() {
-//   if (currentMode == Mode::MANUAL) {
-//     handleManual();
-//   } else {
-//     autoModeSequence();
-//     currentMode = Mode::MANUAL;
-//     Serial.println("Auto sequence complete. Returning to MANUAL mode.");
-//   }
-// }
